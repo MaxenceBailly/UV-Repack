@@ -12,6 +12,14 @@
  *                       fit inside them. The list also takes the Resolution into
  *                       account, so a reduced resolution unlocks smaller sizes.
  *
+ * Animated (flipbook) textures are supported: every frame is repacked with the same
+ * layout, frames stay stacked vertically, and the output sizes keep the frame aspect
+ * ratio so Blockbench still detects the animation.
+ *
+ * Several textures sharing the same layout (same frame size, e.g. a texture and its
+ * variants or emissive map) can be selected and repacked together: islands come from
+ * every face using any of them, and the same layout is applied to all of them.
+ *
  * Author: MaxenceBailly
  */
 
@@ -21,6 +29,17 @@
 	const MAX_REGIONS = 5000;
 	const MIN_SIZE = 16;
 	const RESOLUTION_STEPS = [100, 75, 50, 25, 12.5];
+
+	// Number of flipbook frames stacked vertically in the texture (1 if not animated).
+	function getFrameCount(tex) {
+		const n = tex.frameCount;
+		return (n > 1 && Number.isInteger(n)) ? n : 1;
+	}
+
+	function gcd(a, b) {
+		while (b) { const t = b; b = a % b; a = t; }
+		return a;
+	}
 
 	/* ------------------------------------------------------------------ *
 	 *  UV helpers
@@ -61,11 +80,11 @@
 	}
 
 	/**
-	 * Collect every face referencing `tex`. Box UV cubes that use the texture are
+	 * Collect every face referencing one of `textures`. Box UV cubes that use them are
 	 * flagged so they get frozen to per-face UV (their UVs are already stored on
 	 * each face and would otherwise be recalculated from the box layout).
 	 */
-	function collectFaces(tex) {
+	function collectFaces(textures) {
 		const faces = [];
 		const cubes_to_convert = new Set();
 
@@ -76,7 +95,7 @@
 				if (!face || face.texture === null || face.texture === false) continue;
 				let face_texture;
 				try { face_texture = face.getTexture(); } catch (e) { continue; }
-				if (face_texture !== tex) continue;
+				if (!textures.includes(face_texture)) continue;
 				const pts = getFaceUVPoints(face);
 				if (!pts) continue;
 				if (element.box_uv) cubes_to_convert.add(element);
@@ -89,12 +108,9 @@
 	/**
 	 * Build the unique pixel rectangles to pack. Faces covering the exact same
 	 * rectangle (mirrored faces) are merged so pixels are copied only once.
+	 * For flipbooks, rectangles are expressed in the coordinates of a single frame.
 	 */
-	function buildRegions(faces, tex) {
-		const W = tex.width;
-		const H = tex.height;
-		const uvW = tex.getUVWidth();
-		const uvH = tex.getUVHeight();
+	function buildRegions(faces, W, H, uvW, uvH) {
 		const scaleX = W / uvW;
 		const scaleY = H / uvH;
 
@@ -130,14 +146,55 @@
 			region.faces.push(item);
 		}
 
-		return { regions: Array.from(map.values()), W, H, uvW, uvH };
+		return { regions: Array.from(map.values()) };
 	}
 
-	function analyze(tex) {
-		const { faces, cubes_to_convert } = collectFaces(tex);
+	// Frame size + UV size of a texture, which define its layout.
+	function getLayout(tex) {
+		const frames = getFrameCount(tex);
+		return {
+			frames,
+			W: tex.width,
+			H: tex.height / frames,
+			uvW: tex.getUVWidth(),
+			uvH: tex.getUVHeight()
+		};
+	}
+
+	/**
+	 * Analyze a group of textures sharing the same layout (same frame size and UV
+	 * size, e.g. a texture and its variants or emissive map). Islands are taken from
+	 * every face using any of them, and the result is applied to all of them.
+	 * Returns { error } if the layouts differ, or null if no face uses the textures.
+	 */
+	function analyze(textures) {
+		const layouts = textures.map(getLayout);
+		const ref = layouts[0];
+		for (let i = 1; i < layouts.length; i++) {
+			const l = layouts[i];
+			if (l.W !== ref.W || l.H !== ref.H || l.uvW !== ref.uvW || l.uvH !== ref.uvH) {
+				return {
+					error: 'The selected textures do not share the same layout: ' +
+						textures[0].name + ' is ' + ref.W + ' x ' + ref.H + ', ' +
+						textures[i].name + ' is ' + l.W + ' x ' + l.H + ' (per frame).'
+				};
+			}
+		}
+
+		const { faces, cubes_to_convert } = collectFaces(textures);
 		if (!faces.length) return null;
-		const built = buildRegions(faces, tex);
-		return Object.assign({ faces, cubes_to_convert }, built);
+		const built = buildRegions(faces, ref.W, ref.H, ref.uvW, ref.uvH);
+		return Object.assign({
+			textures,
+			frames: layouts.map(l => l.frames),
+			animated: layouts.some(l => l.frames > 1),
+			faces,
+			cubes_to_convert,
+			W: ref.W,
+			H: ref.H,
+			uvW: ref.uvW,
+			uvH: ref.uvH
+		}, built);
 	}
 
 	// Pixel size of an island after applying a scale factor k.
@@ -236,13 +293,46 @@
 	/**
 	 * Return the selectable output sizes for the given spacing and resolution.
 	 * Islands are measured at `resolution` (no further resampling), so this lists
-	 * the real PNG sizes that can hold them.
+	 * the real PNG sizes that can hold them. Sizes are per frame for flipbooks.
 	 */
 	function computeSizeOptions(analysis, gap, resolution) {
-		const { regions, W, H } = analysis;
+		const { regions, W, H, animated } = analysis;
 		const rects = regions.map(r => scaleRect(r, resolution));
 		const seen = new Set();
 		const options = [];
+
+		if (animated) {
+			// Blockbench only detects flipbook frames when their aspect ratio matches the
+			// UV space, so only sizes proportional to the current frame are offered.
+			const g = gcd(W, H);
+			const stepW = W / g, stepH = H / g;
+			const fits = m => !!packRects(rects, stepW * m, stepH * m, gap);
+			const add = (w, h, suffix) => {
+				const key = w + 'x' + h;
+				if (seen.has(key) || (w === W && h === H)) return;
+				seen.add(key);
+				options.push({ value: key, w, h, label: w + ' x ' + h + suffix });
+			};
+
+			if (fits(g)) {
+				// Smallest proportional size (packing is close enough to monotonic).
+				let lo = 1, hi = g;
+				while (lo < hi) {
+					const mid = (lo + hi) >> 1;
+					if (fits(mid)) hi = mid; else lo = mid + 1;
+				}
+				if (lo < g) add(stepW * lo, stepH * lo, '   (minimum)');
+
+				// Halvings of the current frame size.
+				for (let m = g / 2; Number.isInteger(m) && m >= lo; m /= 2) {
+					if (Math.max(stepW * m, stepH * m) < MIN_SIZE) break;
+					if (fits(m)) add(stepW * m, stepH * m, '');
+				}
+			}
+
+			options.sort((a, b) => a.w * a.h - b.w * b.h);
+			return options;
+		}
 
 		// Exact minimum: pack at the current size, then measure the used area.
 		const packed_full = packRects(rects, W, H, gap);
@@ -275,13 +365,37 @@
 	 *  Repack
 	 * ------------------------------------------------------------------ */
 
-	function repackTexture(tex, analysis, gap, size, resolution) {
-		if (!analysis) {
-			Blockbench.showMessageBox({ title: 'Repack UV', message: 'No face in this model uses this texture.', icon: 'info' });
-			return;
-		}
+	// Copy every island of `tex` (all its frames) to its packed position.
+	function buildPackedCanvas(tex, frames, regions, placed, target_rects, W, H, canvasW, canvasH) {
+		const source = document.createElement('canvas');
+		source.width = W;
+		source.height = H * frames;
+		const sourceCtx = source.getContext('2d');
+		const src_image = (tex.canvas && tex.canvas.width) ? tex.canvas : tex.img;
+		sourceCtx.drawImage(src_image, 0, 0, W, H * frames);
 
-		const { regions, W, H, uvW, uvH, faces, cubes_to_convert } = analysis;
+		const output = document.createElement('canvas');
+		output.width = canvasW;
+		output.height = canvasH * frames;
+		const outputCtx = output.getContext('2d');
+		outputCtx.imageSmoothingEnabled = false;
+
+		for (let f = 0; f < frames; f++) {
+			regions.forEach((region, i) => {
+				const p = placed[i];
+				const t = target_rects[i];
+				outputCtx.drawImage(
+					source,
+					region.x, region.y + f * H, region.w, region.h,
+					p.x, p.y + f * canvasH, t.w, t.h
+				);
+			});
+		}
+		return output;
+	}
+
+	function repackTextures(analysis, gap, size, resolution) {
+		const { textures, frames, animated, regions, W, H, uvW, uvH, faces, cubes_to_convert } = analysis;
 		if (regions.length > MAX_REGIONS) {
 			throw new Error('Too many UV islands to process (' + regions.length + ').');
 		}
@@ -301,30 +415,11 @@
 			return;
 		}
 
-		// Snapshot the current texture.
-		const source = document.createElement('canvas');
-		source.width = W;
-		source.height = H;
-		const sourceCtx = source.getContext('2d');
-		const src_image = (tex.canvas && tex.canvas.width) ? tex.canvas : tex.img;
-		sourceCtx.drawImage(src_image, 0, 0, W, H);
-
-		// Build the new texture.
-		const output = document.createElement('canvas');
-		output.width = canvasW;
-		output.height = canvasH;
-		const outputCtx = output.getContext('2d');
-		outputCtx.imageSmoothingEnabled = false;
-
-		regions.forEach((region, i) => {
-			const p = placed[i];
-			const t = target_rects[i];
-			outputCtx.drawImage(
-				source,
-				region.x, region.y, region.w, region.h,
-				p.x, p.y, t.w, t.h
-			);
-		});
+		// Build every new texture before touching anything, applying the same layout
+		// to every texture and every frame.
+		const outputs = textures.map((tex, ti) =>
+			buildPackedCanvas(tex, frames[ti], regions, placed, target_rects, W, H, canvasW, canvasH)
+		);
 
 		// Apply UV + texture changes in a single undo step.
 		const affected_elements = [];
@@ -333,7 +428,7 @@
 			if (!seen.has(item.element)) { seen.add(item.element); affected_elements.push(item.element); }
 		}
 
-		Undo.initEdit({ elements: affected_elements, textures: [tex], bitmap: true });
+		Undo.initEdit({ elements: affected_elements, textures: textures.slice(), bitmap: true });
 
 		cubes_to_convert.forEach(cube => cube.setUVMode(false));
 
@@ -352,27 +447,33 @@
 			region.faces.forEach(item => transformFaceUV(item.face, scaleU, scaleV, offsetU, offsetV));
 		});
 
-		tex.edit((canvas, painter) => {
-			const ctx = painter.ctx;
-			canvas.width = canvasW;
-			canvas.height = canvasH;
-			ctx.imageSmoothingEnabled = false;
-			ctx.clearRect(0, 0, canvasW, canvasH);
-			ctx.drawImage(output, 0, 0);
-			tex.width = canvasW;
-			tex.height = canvasH;
-			if (size || resolution !== 1) tex.keep_size = true;
-		}, { no_undo: true, no_undo_init: true, no_undo_finish: true });
+		textures.forEach((tex, ti) => {
+			const output = outputs[ti];
+			tex.edit((canvas, painter) => {
+				const ctx = painter.ctx;
+				canvas.width = output.width;
+				canvas.height = output.height;
+				ctx.imageSmoothingEnabled = false;
+				ctx.clearRect(0, 0, output.width, output.height);
+				ctx.drawImage(output, 0, 0);
+				tex.width = output.width;
+				tex.height = output.height;
+				if (size || resolution !== 1) tex.keep_size = true;
+			}, { no_undo: true, no_undo_init: true, no_undo_finish: true });
+		});
 
 		Undo.finishEdit('Repack UV');
 
 		Canvas.updateAllUVs();
-		Canvas.updateView({ elements: affected_elements, element_aspects: { uv: true }, textures: [tex] });
-		Blockbench.dispatchEvent('update_texture', { texture: tex });
+		Canvas.updateView({ elements: affected_elements, element_aspects: { uv: true }, textures: textures.slice() });
+		textures.forEach(tex => Blockbench.dispatchEvent('update_texture', { texture: tex }));
+		if (animated && typeof TextureAnimator !== 'undefined' && TextureAnimator.updateButton) {
+			TextureAnimator.updateButton();
+		}
 
 		Blockbench.showQuickMessage(
-			'Repack UV done: ' + regions.length + ' island(s), ' + moved + ' changed, ' +
-			canvasW + ' x ' + canvasH + '.',
+			'Repack UV done: ' + textures.length + ' texture(s), ' + regions.length + ' island(s), ' +
+			moved + ' changed, ' + canvasW + ' x ' + canvasH + (animated ? ' per frame' : '') + '.',
 			3000
 		);
 	}
@@ -381,35 +482,59 @@
 	 *  Dialog
 	 * ------------------------------------------------------------------ */
 
-	function openDialog(tex) {
+	// Textures to repack: the whole texture selection if the clicked one is part of
+	// it, otherwise only the clicked texture.
+	function getTargetTextures(clicked) {
+		const selected = Texture.all.filter(t => t.selected || t.multi_selected);
+		if (selected.length > 1 && selected.includes(clicked)) return selected;
+		return [clicked];
+	}
+
+	function checkTexture(tex) {
+		if (!tex.width || !tex.height || !tex.img) {
+			return tex.name + ' is not loaded.';
+		}
+		if (tex.frameCount > 1 && (!Number.isInteger(tex.frameCount) || tex.height % tex.frameCount !== 0)) {
+			return 'The flipbook frames of ' + tex.name + ' have an invalid height.';
+		}
+		if (tex.layers_enabled) {
+			return 'Disable the layers of ' + tex.name + ' first (right click > Disable layers), then try again.';
+		}
+		return null;
+	}
+
+	function openDialog(textures) {
 		if (!Project || !Project.elements || !Project.elements.length) {
 			Blockbench.showMessageBox({ title: 'Repack UV', message: 'No model open.', icon: 'info' });
 			return;
 		}
-		if (!tex.width || !tex.height || !tex.img) {
-			Blockbench.showMessageBox({ title: 'Repack UV', message: 'The texture is not loaded.', icon: 'warning' });
-			return;
+		for (const tex of textures) {
+			const problem = checkTexture(tex);
+			if (problem) {
+				Blockbench.showMessageBox({ title: 'Repack UV', message: problem, icon: 'warning' });
+				return;
+			}
 		}
-		if (tex.frameCount > 1) {
-			Blockbench.showMessageBox({ title: 'Repack UV', message: 'Animated (flipbook) textures are not supported.', icon: 'warning' });
-			return;
-		}
-		if (tex.layers_enabled) {
+
+		const analysis = analyze(textures);
+		if (!analysis) {
 			Blockbench.showMessageBox({
 				title: 'Repack UV',
-				message: 'Disable the texture layers first (right click > Disable layers), then try again.',
-				icon: 'warning'
+				message: textures.length > 1 ? 'No face in this model uses these textures.' : 'No face in this model uses this texture.',
+				icon: 'info'
 			});
 			return;
 		}
-
-		const analysis = analyze(tex);
-		if (!analysis) {
-			Blockbench.showMessageBox({ title: 'Repack UV', message: 'No face in this model uses this texture.', icon: 'info' });
+		if (analysis.error) {
+			Blockbench.showMessageBox({ title: 'Repack UV', message: analysis.error, icon: 'warning' });
 			return;
 		}
 
-		const { W, H, regions } = analysis;
+		const { W, H, regions, animated } = analysis;
+		const size_suffix = animated ? ' per frame' : '';
+		const texture_label = textures.map((tex, i) =>
+			tex.name + (analysis.frames[i] > 1 ? ' (' + analysis.frames[i] + ' frames)' : '')
+		).join(', ');
 
 		// --- controls ---
 		const gap_input = document.createElement('input');
@@ -452,7 +577,7 @@
 			size_select.innerHTML = '';
 			const current = document.createElement('option');
 			current.value = 'current';
-			current.textContent = 'Keep current size (' + W + ' x ' + H + ')';
+			current.textContent = 'Keep current size (' + W + ' x ' + H + size_suffix + ')';
 			size_select.append(current);
 
 			options.forEach(o => {
@@ -473,7 +598,7 @@
 			let text = '';
 			if (options.length) {
 				const smallest = options[0];
-				text = 'Smallest size with this spacing/resolution: ' + smallest.w + ' x ' + smallest.h + '.';
+				text = 'Smallest size with this spacing/resolution: ' + smallest.w + ' x ' + smallest.h + size_suffix + '.';
 			} else {
 				text = 'No smaller size works with this spacing/resolution (you can still keep the current size, or lower the resolution).';
 			}
@@ -491,14 +616,15 @@
 			title: 'Repack UV',
 			width: 580,
 			lines: [
-				'Texture: ' + tex.name + ' (' + W + ' x ' + H + ') - ' + regions.length + ' UV island(s).',
+				(textures.length > 1 ? 'Textures: ' : 'Texture: ') + texture_label,
+				W + ' x ' + H + size_suffix + ' - ' + regions.length + ' UV island(s).',
 				'',
 				{ label: 'Spacing between islands (px)', node: gap_input },
 				{ label: 'Resolution', node: resolution_select },
-				{ label: 'Output size', node: size_select },
+				{ label: animated ? 'Output size (per frame)' : 'Output size', node: size_select },
 				info,
 				'',
-				'UVs and the texture are modified together in a single step, so you can undo with Ctrl+Z.'
+				'UVs and textures are modified together in a single step, so you can undo with Ctrl+Z.'
 			],
 			buttons: ['dialog.confirm', 'dialog.cancel'],
 			onConfirm() {
@@ -511,7 +637,7 @@
 					size = { w: parseInt(parts[0], 10), h: parseInt(parts[1], 10) };
 				}
 				try {
-					repackTexture(tex, analysis, gap, size, resolution);
+					repackTextures(analysis, gap, size, resolution);
 				} catch (e) {
 					console.error(e);
 					Blockbench.showMessageBox({
@@ -538,7 +664,7 @@
 		icon: 'grid_on',
 		author: 'MaxenceBailly',
 		description: 'Compact the UVs of a texture (and its pixels) so the model stays identical. Right click a texture to use it.',
-		version: '1.2.0',
+		version: '1.4.0',
 		variant: 'both',
 
 		onload() {
@@ -548,7 +674,7 @@
 				icon: 'grid_on',
 				description: 'Compact this texture UVs and pixels',
 				click(texture) {
-					if (texture instanceof Texture) openDialog(texture);
+					if (texture instanceof Texture) openDialog(getTargetTextures(texture));
 				}
 			};
 
