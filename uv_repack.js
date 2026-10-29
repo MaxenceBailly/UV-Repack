@@ -11,6 +11,9 @@
  *                       when, once the islands are repacked 1:1 (no resampling), they
  *                       fit inside them. The list also takes the Resolution into
  *                       account, so a reduced resolution unlocks smaller sizes.
+ *  - Remove pixels outside the UVs : inside each island, clear the pixels that no
+ *                       face covers (e.g. the corners around triangles or rotated
+ *                       mesh faces). Pixels outside every island are always dropped.
  *
  * Animated (flipbook) textures are supported: every frame is repacked with the same
  * layout, frames stay stacked vertically, and the output sizes keep the frame aspect
@@ -61,6 +64,22 @@
 		return null;
 	}
 
+	// UV outline of a face as an ordered polygon (used to clean pixels outside UVs).
+	function getFaceUVPolygon(face) {
+		const uv = face.uv;
+		if (Array.isArray(uv)) {
+			return [[uv[0], uv[1]], [uv[2], uv[1]], [uv[2], uv[3]], [uv[0], uv[3]]];
+		}
+		if (!uv || typeof uv !== 'object') return null;
+		let keys = null;
+		if (typeof face.getSortedVertices === 'function') {
+			try { keys = face.getSortedVertices(); } catch (e) { keys = null; }
+		}
+		if (!keys || !keys.length) keys = Object.keys(uv);
+		const poly = keys.filter(k => Array.isArray(uv[k])).map(k => [uv[k][0], uv[k][1]]);
+		return poly.length >= 3 ? poly : null;
+	}
+
 	// Scale (around the UV space origin) + translate a face's UVs.
 	function transformFaceUV(face, scaleU, scaleV, offsetU, offsetV) {
 		const uv = face.uv;
@@ -99,7 +118,7 @@
 				const pts = getFaceUVPoints(face);
 				if (!pts) continue;
 				if (element.box_uv) cubes_to_convert.add(element);
-				faces.push({ element, key, face, pts });
+				faces.push({ element, key, face, pts, poly: getFaceUVPolygon(face) });
 			}
 		}
 		return { faces, cubes_to_convert };
@@ -365,8 +384,90 @@
 	 *  Repack
 	 * ------------------------------------------------------------------ */
 
-	// Copy every island of `tex` (all its frames) to its packed position.
-	function buildPackedCanvas(tex, frames, regions, placed, target_rects, W, H, canvasW, canvasH) {
+	/* ------------------------------------------------------------------ *
+	 *  Cleaning (pixels outside the UVs)
+	 * ------------------------------------------------------------------ */
+
+	const MASK_SUBSAMPLES = 4;
+
+	function polygonArea(poly) {
+		let a = 0;
+		for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+			a += (poly[j][0] + poly[i][0]) * (poly[j][1] - poly[i][1]);
+		}
+		return a / 2;
+	}
+
+	function pointInPolygon(poly, x, y) {
+		let inside = false;
+		for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+			const xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+			if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+		}
+		return inside;
+	}
+
+	// A pixel is kept when any of its sub-samples falls inside the polygon. Samples
+	// never sit on pixel borders, so UV edges aligned on the pixel grid don't bleed.
+	function pixelTouchesPolygon(poly, px, py) {
+		for (let sy = 0; sy < MASK_SUBSAMPLES; sy++) {
+			for (let sx = 0; sx < MASK_SUBSAMPLES; sx++) {
+				const x = px + (sx + 0.5) / MASK_SUBSAMPLES;
+				const y = py + (sy + 0.5) / MASK_SUBSAMPLES;
+				if (pointInPolygon(poly, x, y)) return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Mask (opaque = keep) of the pixels of a region actually covered by its faces.
+	 * Degenerate faces (zero area, e.g. a flat cube face) keep the whole region.
+	 */
+	function buildRegionMask(region, scaleX, scaleY) {
+		const { x, y, w, h } = region;
+		const polys = [];
+		let full = false;
+		for (const item of region.faces) {
+			if (!item.poly) { full = true; break; }
+			const poly = item.poly.map(p => [p[0] * scaleX - x, p[1] * scaleY - y]);
+			if (Math.abs(polygonArea(poly)) < 1e-6) { full = true; break; }
+			let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+			for (const p of poly) {
+				minX = Math.min(minX, p[0]); maxX = Math.max(maxX, p[0]);
+				minY = Math.min(minY, p[1]); maxY = Math.max(maxY, p[1]);
+			}
+			polys.push({ poly, minX, minY, maxX, maxY });
+		}
+
+		const mask = document.createElement('canvas');
+		mask.width = w;
+		mask.height = h;
+		const ctx = mask.getContext('2d');
+		if (full) {
+			ctx.fillStyle = '#fff';
+			ctx.fillRect(0, 0, w, h);
+			return mask;
+		}
+
+		const image = ctx.createImageData(w, h);
+		const data = image.data;
+		for (let py = 0; py < h; py++) {
+			for (let px = 0; px < w; px++) {
+				const keep = polys.some(p =>
+					px + 1 > p.minX && px < p.maxX && py + 1 > p.minY && py < p.maxY &&
+					pixelTouchesPolygon(p.poly, px, py)
+				);
+				if (keep) data[(py * w + px) * 4 + 3] = 255;
+			}
+		}
+		ctx.putImageData(image, 0, 0);
+		return mask;
+	}
+
+	// Copy every island of `tex` (all its frames) to its packed position. With
+	// `masks`, pixels of an island that no face covers are left transparent.
+	function buildPackedCanvas(tex, frames, regions, placed, target_rects, W, H, canvasW, canvasH, masks) {
 		const source = document.createElement('canvas');
 		source.width = W;
 		source.height = H * frames;
@@ -380,21 +481,34 @@
 		const outputCtx = output.getContext('2d');
 		outputCtx.imageSmoothingEnabled = false;
 
+		const island = masks ? document.createElement('canvas') : null;
+		const islandCtx = island ? island.getContext('2d') : null;
+
 		for (let f = 0; f < frames; f++) {
 			regions.forEach((region, i) => {
 				const p = placed[i];
 				const t = target_rects[i];
-				outputCtx.drawImage(
-					source,
-					region.x, region.y + f * H, region.w, region.h,
-					p.x, p.y + f * canvasH, t.w, t.h
-				);
+				if (!masks) {
+					outputCtx.drawImage(
+						source,
+						region.x, region.y + f * H, region.w, region.h,
+						p.x, p.y + f * canvasH, t.w, t.h
+					);
+					return;
+				}
+				island.width = region.w;
+				island.height = region.h;
+				islandCtx.drawImage(source, region.x, region.y + f * H, region.w, region.h, 0, 0, region.w, region.h);
+				islandCtx.globalCompositeOperation = 'destination-in';
+				islandCtx.drawImage(masks[i], 0, 0);
+				islandCtx.globalCompositeOperation = 'source-over';
+				outputCtx.drawImage(island, 0, 0, region.w, region.h, p.x, p.y + f * canvasH, t.w, t.h);
 			});
 		}
 		return output;
 	}
 
-	function repackTextures(analysis, gap, size, resolution) {
+	function repackTextures(analysis, gap, size, resolution, clean) {
 		const { textures, frames, animated, regions, W, H, uvW, uvH, faces, cubes_to_convert } = analysis;
 		if (regions.length > MAX_REGIONS) {
 			throw new Error('Too many UV islands to process (' + regions.length + ').');
@@ -417,8 +531,9 @@
 
 		// Build every new texture before touching anything, applying the same layout
 		// to every texture and every frame.
+		const masks = clean ? regions.map(r => buildRegionMask(r, W / uvW, H / uvH)) : null;
 		const outputs = textures.map((tex, ti) =>
-			buildPackedCanvas(tex, frames[ti], regions, placed, target_rects, W, H, canvasW, canvasH)
+			buildPackedCanvas(tex, frames[ti], regions, placed, target_rects, W, H, canvasW, canvasH, masks)
 		);
 
 		// Apply UV + texture changes in a single undo step.
@@ -557,6 +672,10 @@
 		const size_select = document.createElement('select');
 		size_select.style.minWidth = '240px';
 
+		const clean_input = document.createElement('input');
+		clean_input.type = 'checkbox';
+		clean_input.checked = false;
+
 		const info = document.createElement('div');
 		info.style.marginTop = '6px';
 		info.style.opacity = '0.75';
@@ -622,6 +741,7 @@
 				{ label: 'Spacing between islands (px)', node: gap_input },
 				{ label: 'Resolution', node: resolution_select },
 				{ label: animated ? 'Output size (per frame)' : 'Output size', node: size_select },
+				{ label: 'Remove pixels outside the UVs', node: clean_input },
 				info,
 				'',
 				'UVs and textures are modified together in a single step, so you can undo with Ctrl+Z.'
@@ -637,7 +757,7 @@
 					size = { w: parseInt(parts[0], 10), h: parseInt(parts[1], 10) };
 				}
 				try {
-					repackTextures(analysis, gap, size, resolution);
+					repackTextures(analysis, gap, size, resolution, clean_input.checked);
 				} catch (e) {
 					console.error(e);
 					Blockbench.showMessageBox({
@@ -664,7 +784,7 @@
 		icon: 'grid_on',
 		author: 'MaxenceBailly',
 		description: 'Compact the UVs of a texture (and its pixels) so the model stays identical. Right click a texture to use it.',
-		version: '1.4.0',
+		version: '1.5.0',
 		variant: 'both',
 
 		onload() {
